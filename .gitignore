@@ -1,0 +1,6 @@
+__pycache__/
+*/__pycache__/
+*.pyc
+experiments
+temp_syn
+wandb/
