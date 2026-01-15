@@ -273,13 +273,7 @@ class AdvSynthesizer():
         # print("loss_adv: ", loss_adv)
         # print("loss_sim: ", loss_sim)
         if self.alg == "DENSE":
-            # Ensure summation works across devices if using Model Parallelism
-            if len(hooks) > 0:
-                first_device = hooks[0].r_feature.device
-                loss_bn = sum([h.r_feature.to(first_device) for h in hooks])
-            else:
-                loss_bn = 0
-                
+            loss_bn = sum([h.r_feature for h in hooks])  # bn层loss
             loss_dense = self.bn * loss_bn + self.oh * loss_oh + self.adv * loss_adv 
             return loss_dense
         elif self.alg == "FedDF":
@@ -287,9 +281,8 @@ class AdvSynthesizer():
             return loss_FedDF
         elif self.alg == "FedFTG":
             loss_md = 0.0
-            device = s_out.device
             for i in range(M):
-                loss_md += -(kldiv(s_out, pred_list[i].to(device), reduction='none').sum(
+                loss_md += -(kldiv(s_out,pred_list[i],   reduction='none').sum(
                         1)).mean()
                 # loss_md += -torch.abs(s_out - pred_list[i].detach()).sum(1).mean()
             loss_md = loss_md / M
@@ -311,22 +304,10 @@ class AdvSynthesizer():
             loss_DFDG = self.oh * loss_oh + self.div * loss_div + self.adv * loss_trans
             return loss_DFDG
         else :
-            # Ensure summation works across devices if using Model Parallelism
-            if len(hooks) > 0:
-                first_device = hooks[0].r_feature.device
-                loss_bn = sum([h.r_feature.to(first_device) for h in hooks])
-            else:
-                loss_bn = 0
-                
-            # Compute loss_sim with cross-device handling
-            # Use device of first prediction as target for comparison
-            # Or use CPU? Use GPU0 (pred_list[0].device usually)
-            base_device = pred_list[0].device
+            loss_bn = sum([h.r_feature for h in hooks])  # bn层loss
             for i in range(M):
-                p_i = pred_list[i].to(base_device)
                 for j in range(i+1,M):
-                    p_j = pred_list[j].to(base_device)
-                    loss_sim += kldiv(p_i, p_j, reduction='none').sum(1).mean()
+                    loss_sim += kldiv(pred_list[i], pred_list[j], reduction='none').sum(1).mean()
             loss_sim /= (M*(M-1)/2)
             loss_ours = self.bn * loss_bn + self.oh * loss_oh + self.adv * loss_adv + self.sim * loss_sim
             return loss_ours

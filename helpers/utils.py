@@ -438,6 +438,7 @@ class DeepInversionHook():
     def __init__(self, module):
         self.hook = module.register_forward_hook(self.hook_fn)
         self.module = module
+        self.r_feature = None # Initialize
 
     def hook_fn(self, module, input, output):  # hook_fn(module, input, output) -> None
         # hook co compute deepinversion's feature distribution regularization
@@ -448,7 +449,14 @@ class DeepInversionHook():
         # other ways might work better, i.g. KL divergence
         r_feature = torch.norm(module.running_var.data - var, 2) + torch.norm(
             module.running_mean.data - mean, 2)
-        self.r_feature = r_feature
+        
+        if self.r_feature is None:
+            self.r_feature = r_feature
+        else:
+            self.r_feature = self.r_feature + r_feature
+
+    def clear(self):
+        self.r_feature = None
 
     def remove(self):
         self.hook.remove()
@@ -592,61 +600,3 @@ def record_net_data_stats(y_train, net_dataidx_map):
 #                         ids += 1
 #     traindata_cls_counts = record_net_data_stats(y_train, net_dataidx_map)
 #     return train_dataset, test_dataset, net_dataidx_map, traindata_cls_counts
-
-class MemoryEfficientEnsemble(torch.nn.Module):
-    def __init__(self, model_template, weight_list, device='cuda'):
-        super().__init__()
-        self.model = model_template
-        self.weights = weight_list # stored on CPU
-        self.device = device
-        self.model.to(self.device)
-        self.model.eval() # Ensure eval mode by default
-
-    def _replace_weights(self, state_dict):
-        """
-        Safely replace model parameters/buffers with tensors from state_dict
-        without in-place modification, preserving computational graph correctness
-        for gradients flowing back to inputs.
-        """
-        for name, param in state_dict.items():
-            # Handle 'module.' prefix if present
-            target_name = name[7:] if name.startswith('module.') else name
-            
-            # Navigate to the target module and attribute name
-            parts = target_name.split('.')
-            m = self.model
-            for p in parts[:-1]:
-                m = getattr(m, p)
-            attr_name = parts[-1]
-            
-            # Create new tensor on device
-            new_tensor = param.to(self.device)
-            
-            # Replace attribute
-            # We use delattr/setattr to bypass Parameter/Buffer restrictions
-            if hasattr(m, attr_name):
-                delattr(m, attr_name)
-            setattr(m, attr_name, new_tensor)
-
-    def forward(self, x, callback=None):
-        logits_total = 0
-        # Iterate over weights, loading them one by one
-        for i, w in enumerate(self.weights):
-            self._replace_weights(w)
-            
-            logits = self.model(x)
-            logits_total = logits_total + logits # accumulation
-            
-            if callback:
-                callback()
-        
-        return logits_total / len(self.weights)
-    
-    def __len__(self):
-        return len(self.weights)
-
-    def __getitem__(self, idx):
-        # Used by other parts of the code (e.g. ensemble wrappers)
-        # Note: This changes the state of self.model internally
-        self._replace_weights(self.weights[idx])
-        return self.model
