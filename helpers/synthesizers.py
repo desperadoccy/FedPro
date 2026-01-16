@@ -1,10 +1,11 @@
 import copy
 from abc import ABC, abstractclassmethod
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 import ipdb
 from kornia import augmentation
 from torchvision import transforms
@@ -29,16 +30,20 @@ class MultiTransform:
         return str(self.transform)
 
 class Ensemble_A(torch.nn.Module):
-    def __init__(self, model_list):
+    def __init__(self, model_list, teacher_device: Optional[str] = None):
         super(Ensemble_A, self).__init__()
         self.models = model_list
+        self.teacher_device = teacher_device  # If set, all teachers are on this device
 
     def forward(self, x):
         logits_total = 0
         input_device = x.device
         for i in range(len(self.models)):
             # Ensure input is on the same device as the model
-            model_device = next(self.models[i].parameters()).device
+            if self.teacher_device is not None:
+                model_device = self.teacher_device
+            else:
+                model_device = next(self.models[i].parameters()).device
             logits = self.models[i](x.to(model_device))
             logits_total += logits.to(input_device)
         logits_e = logits_total / len(self.models)
@@ -160,7 +165,10 @@ class AdvSynthesizer():
     def __init__(self, teacher, model_list, student, generator1, generator2, nz, num_classes, img_size,
                  iterations, lr_g,
                  synthesis_batch_size, sample_batch_size,
-                 adv, bn, oh, save_dir, dataset, alg):
+                 adv, bn, oh, save_dir, dataset, alg,
+                 use_amp: bool = False,
+                 teacher_device: Optional[str] = None,
+                 student_device: Optional[str] = None):
         super(AdvSynthesizer, self).__init__()
         self.student = student
         self.img_size = img_size
@@ -179,9 +187,22 @@ class AdvSynthesizer():
         self.teacher = teacher
         self.dataset = dataset
         self.alg = alg
+        
+        # Large model distillation settings (AMP + Multi-GPU)
+        self.use_amp = use_amp
+        self.teacher_device = teacher_device
+        self.student_device = student_device if student_device else 'cuda:0'
+        self.scaler = GradScaler() if use_amp else None
+        
+        if use_amp:
+            print(f"[AdvSynthesizer] AMP enabled with GradScaler")
+        if teacher_device:
+            print(f"[AdvSynthesizer] Teacher models on {teacher_device}, Student/Generator on {self.student_device}")
 
-        self.generator1 = generator1.cuda().train()
-        self.generator2 = generator2.cuda().train() if generator2 != None else None
+        # Move generator to appropriate device (generators are already on the correct device from loop_df_fl.py)
+        # Just set to train mode
+        self.generator1 = generator1.train()
+        self.generator2 = generator2.train() if generator2 != None else None
         self.model_list = model_list
 
         self.div = 1.0
@@ -264,16 +285,27 @@ class AdvSynthesizer():
         M = len(self.model_list)
         pred_list = []
         loss_sim = 0.0
+        input_device = global_view.device
         for teacher in self.model_list:
             teacher.eval()
-            pred_list.append(teacher(global_view))
+            # Move input to teacher's device
+            teacher_device = next(teacher.parameters()).device
+            teacher_out = teacher(global_view.to(teacher_device))
+            # Move output back to input device for consistency
+            pred_list.append(teacher_out.to(input_device))
 
         # print("loss_div: ", loss_div)
         # print("loss_oh: ", loss_oh)
         # print("loss_adv: ", loss_adv)
         # print("loss_sim: ", loss_sim)
         if self.alg == "DENSE":
-            loss_bn = sum([h.r_feature for h in hooks])  # bn层loss
+            # Ensure summation works across devices if using Model Parallelism
+            if len(hooks) > 0:
+                first_device = hooks[0].r_feature.device
+                loss_bn = sum([h.r_feature.to(first_device) for h in hooks])
+            else:
+                loss_bn = 0
+                
             loss_dense = self.bn * loss_bn + self.oh * loss_oh + self.adv * loss_adv 
             return loss_dense
         elif self.alg == "FedDF":
@@ -281,33 +313,46 @@ class AdvSynthesizer():
             return loss_FedDF
         elif self.alg == "FedFTG":
             loss_md = 0.0
+            device = s_out.device
             for i in range(M):
-                loss_md += -(kldiv(s_out,pred_list[i],   reduction='none').sum(
+                loss_md += -(kldiv(s_out, pred_list[i].to(device), reduction='none').sum(
                         1)).mean()
                 # loss_md += -torch.abs(s_out - pred_list[i].detach()).sum(1).mean()
             loss_md = loss_md / M
-            loss_div = self.diversity_loss(noises=z, layer=global_view).cuda()
+            loss_div = self.diversity_loss(noises=z, layer=global_view).to(device)
             loss_FedFTG = self.oh * loss_oh + self.adv * loss_md + self.div * loss_div
             return loss_FedFTG
         elif self.alg == "DFRD":
             mask_dfrd = (s_out.max(1)[1] != targets ).float() * (t_out.max(1)[1] == targets ).float()
             loss_trans = -(kldiv(s_out, t_out, reduction='none').sum(
                         1) * mask_dfrd).mean() 
-            loss_div = self.diversity_loss(noises=z, layer=global_view).cuda()
+            loss_div = self.diversity_loss(noises=z, layer=global_view).to(s_out.device)
             loss_DFRD = self.oh * loss_oh + self.div * loss_div + self.adv * loss_trans
             return loss_DFRD
         elif self.alg == "DFDG":
             mask_dfdg = (s_out.max(1)[1] != targets ).float() * (t_out.max(1)[1] == targets ).float()
             loss_trans = -(kldiv(s_out, t_out, reduction='none').sum(1) * mask_dfdg).mean() 
-            loss_div = self.diversity_loss(noises=z, layer=global_view).cuda()
+            loss_div = self.diversity_loss(noises=z, layer=global_view).to(s_out.device)
             loss_cd = -(kldiv(t_out, dual_t_out, reduction='none').sum(1)).mean()
             loss_DFDG = self.oh * loss_oh + self.div * loss_div + self.adv * loss_trans
             return loss_DFDG
         else :
-            loss_bn = sum([h.r_feature for h in hooks])  # bn层loss
+            # Ensure summation works across devices if using Model Parallelism
+            if len(hooks) > 0:
+                first_device = hooks[0].r_feature.device
+                loss_bn = sum([h.r_feature.to(first_device) for h in hooks])
+            else:
+                loss_bn = 0
+                
+            # Compute loss_sim with cross-device handling
+            # Use device of first prediction as target for comparison
+            # Or use CPU? Use GPU0 (pred_list[0].device usually)
+            base_device = pred_list[0].device
             for i in range(M):
+                p_i = pred_list[i].to(base_device)
                 for j in range(i+1,M):
-                    loss_sim += kldiv(pred_list[i], pred_list[j], reduction='none').sum(1).mean()
+                    p_j = pred_list[j].to(base_device)
+                    loss_sim += kldiv(p_i, p_j, reduction='none').sum(1).mean()
             loss_sim /= (M*(M-1)/2)
             loss_ours = self.bn * loss_bn + self.oh * loss_oh + self.adv * loss_adv + self.sim * loss_sim
             return loss_ours
@@ -315,13 +360,16 @@ class AdvSynthesizer():
         net.eval()
         best_cost = 1e6
         best_inputs = None
-        z = torch.randn(size=(self.synthesis_batch_size, self.nz)).cuda()  #
+        
+        # Use appropriate device based on settings
+        gen_device = self.student_device if self.teacher_device else 'cuda'
+        
+        z = torch.randn(size=(self.synthesis_batch_size, self.nz), device=gen_device)
         z.requires_grad = True
-        targets = torch.randint(low=0, high=self.num_classes, size=(self.synthesis_batch_size,))
+        targets = torch.randint(low=0, high=self.num_classes, size=(self.synthesis_batch_size,), device=gen_device)
         targets = targets.sort()[0]
-        targets = targets.cuda()
-        y = F.one_hot(targets,num_classes=self.num_classes)
-        y = y.float().cuda()
+        y = F.one_hot(targets, num_classes=self.num_classes)
+        y = y.float()
         reset_model(self.generator1)
         if self.generator2 != None:
             reset_model(self.generator2)
@@ -329,7 +377,7 @@ class AdvSynthesizer():
         hooks = []
         #############################################
         dim_in = 500 if "cifar100" == self.dataset else 50
-        net = Ensemble_A(self.model_list)
+        net = Ensemble_A(self.model_list, teacher_device=self.teacher_device)
         net.eval()
         # net_mlp = MLP(dim_in).cuda()
         # net_mlp.train()
@@ -350,45 +398,53 @@ class AdvSynthesizer():
         for it in range(self.iterations):
             self.generator1.zero_grad()
             optimizer.zero_grad()
-            # optimizer_mlp.zero_grad()
-            # gen_imgs, mul_h, e_y = self.generator(z, gen_labels)
-            inputs = self.generator1(z)  # bs,nz
-            global_view, _ = self.aug(inputs)  # crop and normalize
-            t_out = net(global_view)
-            dual_t_out = None
-            if self.generator2 != None:
-                dual_inputs = self.generator2(z)
-                dual_global_view, _ = self.aug(dual_inputs)
-                dual_t_out = net(dual_global_view)
-            #############################################
-            # Gate
-            # data_ensm = net(global_view)
-            # t_out = net_mlp(data_ensm)
-            #############################################
-            # t_out = net(global_view)
-            # loss_bn = sum([h.r_feature for h in hooks])  # bn层loss
-            # loss_oh = F.cross_entropy(t_out, targets)  # ce_loss
+            
+            # Use AMP if enabled
+            if self.use_amp:
+                with autocast():
+                    inputs = self.generator1(z)  # bs,nz
+                    global_view, _ = self.aug(inputs)  # crop and normalize
+                    t_out = net(global_view)
+                    dual_t_out = None
+                    if self.generator2 != None:
+                        dual_inputs = self.generator2(z)
+                        dual_global_view, _ = self.aug(dual_inputs)
+                        dual_t_out = net(dual_global_view)
+                    
+                    s_out = self.student(global_view.to(self.student_device) if self.teacher_device else global_view)
+                    loss = self.loss_g(t_out, dual_t_out, s_out, targets, hooks, global_view, z)
+                
+                if best_cost > loss.item() or best_inputs is None:
+                    best_cost = loss.item()
+                    best_inputs = inputs.data.float()  # Ensure FP32 for saving
+                
+                self.scaler.scale(loss).backward()
+                self.scaler.step(optimizer)
+                self.scaler.update()
+            else:
+                # Original non-AMP path
+                inputs = self.generator1(z)  # bs,nz
+                global_view, _ = self.aug(inputs)  # crop and normalize
+                t_out = net(global_view)
+                dual_t_out = None
+                if self.generator2 != None:
+                    dual_inputs = self.generator2(z)
+                    dual_global_view, _ = self.aug(dual_inputs)
+                    dual_t_out = net(dual_global_view)
 
-            # L_div = self.diversity_loss(noises=mul_h, layer=gen_imgs).cuda()
-
-            s_out = self.student(global_view)
-            # mask = (s_out.max(1)[1] != t_out.max(1)[1]).float()
-            # loss_adv = -(kldiv(s_out, t_out, reduction='none').sum(
-            #     1) * mask).mean()  # decision adversarial distillatio
-
-            # loss = self.bn * loss_bn + self.oh * loss_oh + self.adv * loss_adv 
-            loss = self.loss_g(t_out, dual_t_out, s_out, targets,hooks,global_view,z)
-            # loss = loss_inv
-            if best_cost > loss.item() or best_inputs is None:
-                best_cost = loss.item()
-                best_inputs = inputs.data
-            with torch.autograd.detect_anomaly(True):
-                loss.backward()
-            for name, param in self.generator1.named_parameters():
-                if torch.isnan(param.grad).any():
-                    print(f"Detected NaN in gradient for {name}")
-
-            optimizer.step()
+                s_out = self.student(global_view)
+                loss = self.loss_g(t_out, dual_t_out, s_out, targets, hooks, global_view, z)
+                
+                if best_cost > loss.item() or best_inputs is None:
+                    best_cost = loss.item()
+                    best_inputs = inputs.data
+                    
+                with torch.autograd.detect_anomaly(True):
+                    loss.backward()
+                for name, param in self.generator1.named_parameters():
+                    if torch.isnan(param.grad).any():
+                        print(f"Detected NaN in gradient for {name}")
+                optimizer.step()
             # for state in optimizer.state.values():
             #     if isinstance(state, dict):  # 检查状态字典
             #         for key, value in state.items():
@@ -398,10 +454,10 @@ class AdvSynthesizer():
             # optimizer_mlp.step()
             # t.set_description('iters:{}, loss:{}'.format(it, loss.item()))
         # vutils.save_image(best_inputs.clone(), '1.png', normalize=True, scale_each=True, nrow=10)
-        self.data_pool.add(best_inputs,targets)
+        self.data_pool.add(best_inputs, targets.cpu())
 
         # generator2
-        z = torch.randn(size=(self.synthesis_batch_size, self.nz)).cuda()  #
+        z = torch.randn(size=(self.synthesis_batch_size, self.nz), device=gen_device)
         z.requires_grad = True
         best_cost = 1e6
         best_inputs = None
@@ -414,44 +470,49 @@ class AdvSynthesizer():
             for it in range(self.iterations):
                 self.generator2.zero_grad()
                 optimizer.zero_grad()
-                # optimizer_mlp.zero_grad()
-                # gen_imgs, mul_h, e_y = self.generator(z, gen_labels)
-                inputs = self.generator2(z)  # bs,nz
-                global_view, _ = self.aug(inputs)  # crop and normalize
-                t_out = net(global_view)
+                
+                if self.use_amp:
+                    with autocast():
+                        inputs = self.generator2(z)
+                        global_view, _ = self.aug(inputs)
+                        t_out = net(global_view)
+                        
+                        dual_inputs = self.generator1(z)
+                        dual_global_view, _ = self.aug(dual_inputs)
+                        dual_t_out = net(dual_global_view)
+                        
+                        s_out = self.student(global_view.to(self.student_device) if self.teacher_device else global_view)
+                        loss = self.loss_g(t_out, dual_t_out, s_out, targets, hooks, global_view, z)
+                    
+                    if best_cost > loss.item() or best_inputs is None:
+                        best_cost = loss.item()
+                        best_inputs = inputs.data.float()
+                    
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+                else:
+                    inputs = self.generator2(z)
+                    global_view, _ = self.aug(inputs)
+                    t_out = net(global_view)
 
-                dual_inputs = self.generator1(z)
-                dual_global_view, _ = self.aug(dual_inputs)
-                dual_t_out = net(dual_global_view)
-                #############################################
-                # Gate
-                # data_ensm = net(global_view)
-                # t_out = net_mlp(data_ensm)
-                #############################################
-                # t_out = net(global_view)
-                # loss_bn = sum([h.r_feature for h in hooks])  # bn层loss
-                # loss_oh = F.cross_entropy(t_out, targets)  # ce_loss
+                    dual_inputs = self.generator1(z)
+                    dual_global_view, _ = self.aug(dual_inputs)
+                    dual_t_out = net(dual_global_view)
 
-                # L_div = self.diversity_loss(noises=mul_h, layer=gen_imgs).cuda()
-
-                s_out = self.student(global_view)
-                # mask = (s_out.max(1)[1] != t_out.max(1)[1]).float()
-                # loss_adv = -(kldiv(s_out, t_out, reduction='none').sum(
-                #     1) * mask).mean()  # decision adversarial distillatio
-
-                # loss = self.bn * loss_bn + self.oh * loss_oh + self.adv * loss_adv 
-                loss = self.loss_g(t_out, dual_t_out, s_out, targets,hooks,global_view,z)
-                # loss = loss_inv
-                if best_cost > loss.item() or best_inputs is None:
-                    best_cost = loss.item()
-                    best_inputs = inputs.data
-                with torch.autograd.detect_anomaly(True):
-                    loss.backward()
-                for name, param in self.generator2.named_parameters():
-                    if torch.isnan(param.grad).any():
-                        print(f"Detected NaN in gradient for {name}")
-
-                optimizer.step()
+                    s_out = self.student(global_view)
+                    loss = self.loss_g(t_out, dual_t_out, s_out, targets, hooks, global_view, z)
+                    
+                    if best_cost > loss.item() or best_inputs is None:
+                        best_cost = loss.item()
+                        best_inputs = inputs.data
+                        
+                    with torch.autograd.detect_anomaly(True):
+                        loss.backward()
+                    for name, param in self.generator2.named_parameters():
+                        if torch.isnan(param.grad).any():
+                            print(f"Detected NaN in gradient for {name}")
+                    optimizer.step()
                 # for state in optimizer.state.values():
                 #     if isinstance(state, dict):  # 检查状态字典
                 #         for key, value in state.items():
@@ -465,4 +526,4 @@ class AdvSynthesizer():
 
         # save best inputs and reset data iter
         if best_inputs != None:
-            self.data_pool.add(best_inputs,targets)  # 生成了一个batch的数据
+            self.data_pool.add(best_inputs, targets.cpu())  # 生成了一个batch的数据

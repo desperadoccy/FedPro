@@ -137,6 +137,11 @@ def args_parser():
     parser.add_argument('--run_name', default=None, type=str, help='optional name for the run')
     parser.add_argument('--continuous_teacher', action='store_true', help='maintain a single teacher model instance and update weights')
     parser.add_argument('--optimizer', type=str, default='sgd', help='optimizer: sgd|adam|adamw')
+    
+    # Multi-GPU Support
+    parser.add_argument('--teacher_device', type=str, default=None, help='device for teacher models (e.g., cuda:0). If None, use default cuda')
+    parser.add_argument('--student_device', type=str, default=None, help='device for student model and generator (e.g., cuda:1). If None, use default cuda')
+    parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision (AMP) for memory efficiency')
 
     args = parser.parse_args()
     return args
@@ -163,13 +168,23 @@ def kd_train_ensemble(synthesizer, model, criterion, optimizer, test_loader):
     teacher.eval()
     total_loss = 0.0
     correct = 0.0
+    
+    # Get devices
+    student_device = next(student.parameters()).device
+    teacher_device = next(teacher.parameters()).device
 
     for idx, (images, label) in enumerate(synthesizer.get_data()):
         optimizer.zero_grad()
-        images = images.cuda()
+        # Move images to teacher device for inference
+        images_teacher = images.to(teacher_device)
         with torch.no_grad():
-            t_out = teacher(images)
-        s_out = student(images.detach())
+            t_out = teacher(images_teacher)
+        
+        # Move images and teacher output to student device
+        images_student = images.to(student_device)
+        t_out = t_out.to(student_device)
+        
+        s_out = student(images_student.detach())
         loss_s = criterion(s_out, t_out.detach())
 
         loss_s.backward()
@@ -187,24 +202,37 @@ def kd_train(synthesizer, model, criterion, optimizer, test_loader, ensemble_mod
     ensemble_model.eval()
     total_loss = 0.0
     correct = 0.0
+    
+    # Get devices
+    student_device = next(student.parameters()).device
 
     for idx, (images, label) in enumerate(synthesizer.get_data()):
-        # ensemble_pred = ensemble_model(images.cuda())
-        # teacher_idx=0
-        images = images.cuda()
+        # Move images and labels to student device
+        images = images.to(student_device)
+        label = label.to(student_device)
         
         for teacher in teacher_list:
             optimizer.zero_grad()
+            
+            # Get teacher device - handle Ensemble class specially
+            if isinstance(teacher, Ensemble):
+                # Ensemble doesn't register models as submodules, get device from first model
+                teacher_device = next(teacher.models[0].parameters()).device
+            else:
+                teacher_device = next(teacher.parameters()).device
+            
             with torch.no_grad():
-                # what's meaning of this line?
-                # ensemble_pred = ensemble_model(images)
-                t_out = teacher(images)
+                # Move images to teacher device for inference
+                images_teacher = images.to(teacher_device)
+                t_out = teacher(images_teacher)
+                # Move teacher output back to student device
+                t_out = t_out.to(student_device)
 
-            mask = (t_out.max(1)[1] == label.cuda()).float()
+            mask = (t_out.max(1)[1] == label).float()
 
             s_out = student(images.detach())
 
-            loss_s = (F.cross_entropy(s_out, label.cuda(), reduction='none') * mask).mean()
+            loss_s = (F.cross_entropy(s_out, label, reduction='none') * mask).mean()
             loss_s += (kldiv(s_out, t_out, reduction='none').sum(1) * mask).mean()
 
             loss_s.backward()
@@ -265,17 +293,18 @@ def interpolate_weights(w_prev, w_curr, alpha):
     return w_new
 
 
-def get_model(args):
+def get_model(args, device='cuda'):
+    """Create model and move to specified device"""
     if args.model == "mnist_cnn":
-        global_model = CNNMnist().cuda()
+        global_model = CNNMnist().to(device)
     elif args.model == "fmnist_cnn":
-        global_model = CNNMnist().cuda()
+        global_model = CNNMnist().to(device)
     elif args.model == "cnn":
-        global_model = CNNCifar().cuda()
+        global_model = CNNCifar().to(device)
     elif args.model == "svhn_cnn":
-        global_model = CNNCifar().cuda()
+        global_model = CNNCifar().to(device)
     elif args.model == "cifar100_cnn":
-        global_model = CNNCifar100().cuda()
+        global_model = CNNCifar100().to(device)
     elif args.model == "res":
         num_classes = 200
         if args.dataset == "eurosat":
@@ -284,7 +313,7 @@ def get_model(args):
             num_classes = 45
         elif args.dataset == "siri-whu":
             num_classes = 12
-        global_model = resnet18(num_classes=num_classes).cuda()
+        global_model = resnet18(num_classes=num_classes).to(device)
     elif args.model == "res50":
         num_classes = 200
         if args.dataset == "eurosat":
@@ -293,7 +322,7 @@ def get_model(args):
             num_classes = 45
         elif args.dataset == "siri-whu":
             num_classes = 12
-        global_model = resnet50(num_classes=num_classes).cuda()
+        global_model = resnet50(num_classes=num_classes).to(device)
     elif args.model == "vit":
         num_classes = 10
         if args.dataset == "tiny":
@@ -311,11 +340,13 @@ def get_model(args):
                                              drop_rate=0.,
                                              drop_path_rate=0.1)
         global_model.head = torch.nn.Linear(global_model.head.in_features, num_classes)
-        global_model = global_model.cuda()
-        global_model = torch.nn.DataParallel(global_model)
+        global_model = global_model.to(device)
+        # Only use DataParallel if on default cuda device
+        if device == 'cuda':
+            global_model = torch.nn.DataParallel(global_model)
     else:
         # Default fallback or error handling
-        global_model = CNNCifar().cuda()
+        global_model = CNNCifar().to(device)
     return global_model
 
 
@@ -357,7 +388,9 @@ def main():
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=32,
                                               shuffle=False, num_workers=4)
     
-    global_model = get_model(args)
+    # Setup device for initial training (pretrain/fedavg uses default cuda)
+    train_device = 'cuda'
+    global_model = get_model(args, device=train_device)
     bst_acc = -1
     local_weights = []
     global_model.train()
@@ -601,7 +634,17 @@ def main():
         print("ensemble acc:")
         test(ensemble_model, test_loader)
         
-        global_model = get_model(args)
+        # Setup devices for distillation
+        teacher_device = args.teacher_device if args.teacher_device else 'cuda'
+        student_device = args.student_device if args.student_device else 'cuda'
+        
+        print(f"\n[Multi-GPU Setup]")
+        print(f"  Teacher models device: {teacher_device}")
+        print(f"  Student/Generator device: {student_device}")
+        print(f"  Use AMP: {args.use_amp}")
+        
+        # Create student model on student device
+        global_model = get_model(args, device=student_device)
 
         # data generator
         nz = args.nz
@@ -612,8 +655,9 @@ def main():
         elif args.dataset == "nwpu" or args.dataset == "siri-whu":
              img_size = 224
         
-        generator1 = Generator(nz=nz, ngf=64, img_size=img_size, nc=nc).cuda()
-        generator2 = Generator(nz=nz, ngf=64, img_size=img_size, nc=nc).cuda() if args.alg == "DFDG" else None
+        # Generators go to student device
+        generator1 = Generator(nz=nz, ngf=64, img_size=img_size, nc=nc).to(student_device)
+        generator2 = Generator(nz=nz, ngf=64, img_size=img_size, nc=nc).to(student_device) if args.alg == "DFDG" else None
         
         args.cur_ep = 0
         img_size2 = (3, 32, 32) if "cifar" in args.dataset or args.dataset == "svhn" else (1, 28, 28)
@@ -636,7 +680,10 @@ def main():
                                      synthesis_batch_size=args.synthesis_batch_size,
                                      sample_batch_size=args.batch_size,
                                      adv=args.adv, bn=args.bn, oh=args.oh,
-                                     save_dir=args.save_dir, dataset=args.dataset, alg=args.alg)
+                                     save_dir=args.save_dir, dataset=args.dataset, alg=args.alg,
+                                     use_amp=args.use_amp,
+                                     teacher_device=teacher_device if args.teacher_device else None,
+                                     student_device=student_device if args.student_device else None)
         
         criterion = KLDiv(T=args.T)
         optimizer = build_optimizer(global_model.parameters(), args)
@@ -720,18 +767,21 @@ def main():
                     print(f"Client {k}: No weights found in checkpoint list. Using random initialization.")
                     test_local_weights[k] = copy.deepcopy(global_model.state_dict())
 
-            # Test Avg Model
+            # Test Avg Model (use CPU for evaluation to save GPU memory)
             test_global_weights = average_weights(test_local_weights)
-            test_global_model = copy.deepcopy(global_model)
+            test_global_model = get_model(args, device='cpu')
             test_global_model.load_state_dict(test_global_weights)
+            test_global_model = test_global_model.cuda()  # Move to default cuda for testing
             print("Last Checkpoint Avg Model Acc:")
             test(test_global_model, test_loader)
             
             # Test Ensemble Model
+            test_model_template = get_model(args, device='cpu')
             test_model_list = []
             for w in test_local_weights:
-                net = copy.deepcopy(global_model)
+                net = copy.deepcopy(test_model_template)
                 net.load_state_dict(w)
+                net = net.cuda()  # Move to default cuda for testing
                 test_model_list.append(net)
             test_ensemble_model = Ensemble(test_model_list)
             print("Last Checkpoint Ensemble Model Acc:")
@@ -776,10 +826,13 @@ def main():
                  print(f"Warning: No client updates found for step {step}. Using previous weights.")
 
             model_list = []
-             
+            
+            # Create teacher models on teacher device
+            teacher_model_template = get_model(args, device=teacher_device)
             for i in range(len(local_weights)):
-                net = copy.deepcopy(global_model)
+                net = copy.deepcopy(teacher_model_template)
                 net.load_state_dict(local_weights[i])
+                net.eval()  # Set to eval mode
                 model_list.append(net)
             ensemble_model = Ensemble(model_list)
             
