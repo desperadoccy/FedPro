@@ -16,8 +16,8 @@ from datetime import datetime
 
 from helpers.datasets import partition_data
 from helpers.synthesizers import AdvSynthesizer
-from helpers.utils import average_weights, DatasetSplit, KLDiv, setup_seed, test, kldiv
-from models.generator import Generator
+from helpers.utils import average_weights, DatasetSplit, KLDiv, setup_seed, test, kldiv, LabelSmoothingCrossEntropy
+from models.generator import Generator, SatelliteGenerator
 from models.nets import CNNCifar, CNNMnist, CNNCifar100
 from models.resnet import resnet18, resnet50, EuroSATResNet, SIRINet
 from models.vit import deit_tiny_patch16_224
@@ -171,10 +171,7 @@ def kd_train_ensemble(synthesizer, model, criterion, optimizer, test_loader):
     
     # Get devices
     student_device = next(student.parameters()).device
-    if isinstance(teacher, Ensemble):
-        teacher_device = next(teacher.models[0].parameters()).device
-    else:
-        teacher_device = next(teacher.parameters()).device
+    teacher_device = next(teacher.parameters()).device
 
     for idx, (images, label) in enumerate(synthesizer.get_data()):
         optimizer.zero_grad()
@@ -702,6 +699,11 @@ def main():
              img_size = 224
         
         # Generators go to student device
+        # if args.dataset == "eurosat" or args.dataset == "siri-whu":
+        #     print(f"Using SatelliteGenerator for {args.dataset} (img_size={img_size})")
+        #     generator1 = SatelliteGenerator(nz=nz, ngf=64, img_size=img_size, nc=nc).to(student_device)
+        #     generator2 = SatelliteGenerator(nz=nz, ngf=64, img_size=img_size, nc=nc).to(student_device) if args.alg == "DFDG" else None
+        # else:
         generator1 = Generator(nz=nz, ngf=64, img_size=img_size, nc=nc).to(student_device)
         generator2 = Generator(nz=nz, ngf=64, img_size=img_size, nc=nc).to(student_device) if args.alg == "DFDG" else None
         

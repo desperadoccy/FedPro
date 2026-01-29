@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+from matplotlib.ticker import AutoMinorLocator
 
 # Adjust path to import helpers and models
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -321,10 +322,13 @@ def main():
 
     plt.figure(figsize=(10, 6))
     
-    for name, curve in results.items():
+    colors = ['#CC5651', '#DC8A00', '#038255', '#76009C']
+    markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h']
+
+    for i, (name, curve) in enumerate(results.items()):
         final_acc = curve[-1] if curve else 0
         print(f"Checkpoint: {name} | Final Student Acc: {final_acc:.2f}%")
-        plt.plot(range(1, len(curve)+1), curve, label=f"{name} (Final: {final_acc:.2f}%)")
+        plt.plot(range(1, len(curve)+1), curve, label=f"{name} (Final: {final_acc:.2f}%)", color=colors[i % len(colors)], marker=markers[i % len(markers)])
     
     plt.xlabel('Distillation Epochs')
     plt.ylabel('Student Accuracy')

@@ -185,14 +185,21 @@ def load_data(dataset, data_dir):
     elif dataset == "eurosat":
         data_transforms = {
             "train": transforms.Compose([
-                transforms.RandomCrop(64, padding=4),
+                transforms.Resize(64),  # EuroSAT 原始尺寸
                 transforms.RandomHorizontalFlip(),
+                transforms.RandomVerticalFlip(),
+                transforms.RandomRotation(30),  # 遥感场景旋转不变
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+                transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
                 transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                transforms.Normalize([0.3442, 0.3801, 0.4077],  # EuroSAT-RGB 实测均值
+                                     [0.2027, 0.1365, 0.1149])  # 标准差
             ]),
             "val": transforms.Compose([
+                transforms.Resize(64),
                 transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                transforms.Normalize([0.3442, 0.3801, 0.4077],
+                                     [0.2027, 0.1365, 0.1149])
             ])
         }
         # Only use local folder under data_dir, do not use torchvision.EuroSAT
@@ -276,11 +283,20 @@ def load_data(dataset, data_dir):
     elif dataset == "siri-whu":
         data_transforms = {
             "train": transforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(224),
+                transforms.Resize(224),  # 上采样到标准尺寸
+                transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),
                 transforms.RandomHorizontalFlip(),
+                transforms.RandomVerticalFlip(),
+                transforms.RandomRotation(45),  # 遥感旋转不变
+                transforms.RandomAffine(degrees=0, translate=(0.15, 0.15), 
+                                       scale=(0.9, 1.1)),
+                transforms.ColorJitter(brightness=0.3, contrast=0.3, 
+                                      saturation=0.3, hue=0.1),
+                transforms.RandomGrayscale(p=0.1),
+                transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
                 transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                transforms.Normalize([0.485, 0.456, 0.406],  # ImageNet 统计
+                                   [0.229, 0.224, 0.225])
             ]),
             "val": transforms.Compose([
                 transforms.Resize(256),
